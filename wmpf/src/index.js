@@ -38,6 +38,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const node_fs_1 = require("node:fs");
+const node_child_process_1 = require("node:child_process");
 const node_events_1 = require("node:events");
 const node_path_1 = __importDefault(require("node:path"));
 const frida = __importStar(require("frida"));
@@ -292,6 +293,34 @@ const proxy_server = (options, logger) => {
             });
     });
 };
+// 通过 PowerShell 读取 exe 的 FileVersion，取末段作为 build 号
+// 避免从路径正则提取时把用户名等数字误判为版本号
+const get_exe_build_version = (exePath) => {
+    const safePath = String(exePath).replace(/'/g, "''");
+    const psCommand = `(Get-Item -LiteralPath '${safePath}').VersionInfo.ProductVersion`;
+    let stdout;
+    try {
+        stdout = node_child_process_1.execFileSync("powershell.exe", [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            psCommand,
+        ], { encoding: "utf8", timeout: 8000 });
+    }
+    catch (e) {
+        throw new Error(`[frida] unable to read FileVersion from ${exePath}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const versionStr = (stdout || "").trim();
+    if (!versionStr) {
+        throw new Error(`[frida] empty FileVersion from ${exePath}`);
+    }
+    const parts = versionStr.split(/[.\s]+/).filter(Boolean);
+    const build = Number(parts[parts.length - 1]);
+    if (!Number.isFinite(build) || build <= 0) {
+        throw new Error(`[frida] invalid build number parsed from FileVersion: ${versionStr}`);
+    }
+    return build;
+};
 const frida_server = async (options, logger) => {
     const localDevice = await frida.getLocalDevice();
     const processes = await localDevice.enumerateProcesses({
@@ -310,16 +339,11 @@ const frida_server = async (options, logger) => {
     }
     const wmpfProcess = processes.filter((process) => process.pid === wmpfPid)[0];
     const wmpfProcessPath = wmpfProcess.parameters.path;
-    const wmpfVersionMatch = wmpfProcessPath
-        ? wmpfProcessPath.match(/\d+/g)
-        : "";
-    const wmpfVersion = wmpfVersionMatch
-        ? new Number(wmpfVersionMatch.pop())
-        : 0;
-    if (wmpfVersion === 0) {
-        throw new Error("[frida] error in find wmpf version");
+    if (!wmpfProcessPath) {
+        throw new Error("[frida] WeChatAppEx process path not found");
         return;
     }
+    const wmpfVersion = get_exe_build_version(wmpfProcessPath);
     // attach to process
     const session = await localDevice.attach(Number(wmpfPid));
     // find hook script（必须用 __dirname：从 run.cjs 入口 require 时 require.main 指向 run.cjs，会错到仓库外）
@@ -345,7 +369,10 @@ const frida_server = async (options, logger) => {
         return;
     }
     // load script
-    const script = await session.createScript(scriptContent.replace("@@CONFIG@@", configContent));
+    const wsUrl = `ws://localhost:${options.debugPort}`;
+    const script = await session.createScript(scriptContent
+        .replace("@@CONFIG@@", configContent)
+        .replace("@@WS_URL@@", wsUrl));
     script.message.connect((message) => {
         if (message.type === "error") {
             logger.error("[frida client]", message);
