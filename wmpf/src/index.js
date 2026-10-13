@@ -161,7 +161,8 @@ const debug_server = (options, logger) => {
     logger.info(`[server] debug server running on ws://localhost:${options.debugPort}`);
     logger.info(`[server] debug server waiting for miniapp to connect...`);
     let messageCounter = 0;
-    const onMessage = (message) => {
+    let nextConnectionId = 0;
+    const onMessage = (ws, message) => {
         let unwrappedData = null;
         try {
             const decodedData = messageProto.mmbizwxadevremote.WARemoteDebug_DebugMessage.decode(message);
@@ -170,10 +171,18 @@ const debug_server = (options, logger) => {
             if (summary) {
                 logger.main_debug(summary);
             }
+            // 统计该连接收到的协议消息类别，便于诊断 WS 重连与协议完整性
+            const cat = (unwrappedData && unwrappedData.category) || "unknown";
+            if (ws.catCounts) {
+                ws.catCounts[cat] = (ws.catCounts[cat] || 0) + 1;
+            }
         }
         catch (e) {
             logger.error(`[miniapp] miniapp client err: ${e}`);
             logger.main_debug(`[miniapp] undecoded raw message (hex): ${bufferToHexString(message).slice(0, 320)}`);
+            if (ws.catCounts) {
+                ws.catCounts["decode_error"] = (ws.catCounts["decode_error"] || 0) + 1;
+            }
         }
         if (unwrappedData === null) {
             return;
@@ -185,17 +194,26 @@ const debug_server = (options, logger) => {
         }
     };
     wss.on("connection", (ws) => {
-        logger.info("[miniapp] miniapp client connected");
+        const cid = ++nextConnectionId;
+        const connectedAt = Date.now();
+        ws.catCounts = {};
+        logger.info(`[miniapp][ws#${cid}] connected active=${wss.clients.size}`);
         debugMessageEmitter.transportState.miniappClientCount += 1;
         debugMessageEmitter.transportState.miniappConnected =
             debugMessageEmitter.transportState.miniappClientCount > 0;
         debugMessageEmitter.emit("miniappconnected");
-        ws.on("message", onMessage);
+        ws.on("message", (message) => onMessage(ws, message));
         ws.on("error", (err) => {
-            logger.error("[miniapp] miniapp client err:", err);
+            logger.error(`[miniapp][ws#${cid}] client err:`, err);
         });
-        ws.on("close", () => {
-            logger.info("[miniapp] miniapp client disconnected");
+        ws.on("close", (code, reason) => {
+            const cats = Object.keys(ws.catCounts).length > 0
+                ? Object.entries(ws.catCounts).map(([k, v]) => `${k}=${v}`).join(" ")
+                : "none";
+            logger.info(
+                `[miniapp][ws#${cid}] closed code=${code} reason=${reason.toString()} ` +
+                `duration=${Date.now() - connectedAt}ms active=${wss.clients.size} cats{${cats}}`,
+            );
             debugMessageEmitter.transportState.miniappClientCount = Math.max(0, debugMessageEmitter.transportState.miniappClientCount - 1);
             debugMessageEmitter.transportState.miniappConnected =
                 debugMessageEmitter.transportState.miniappClientCount > 0;
